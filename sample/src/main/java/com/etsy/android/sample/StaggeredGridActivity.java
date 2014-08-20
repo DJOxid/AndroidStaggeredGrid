@@ -1,7 +1,5 @@
 package com.etsy.android.sample;
 
-import java.util.ArrayList;
-
 import android.app.Activity;
 import android.os.Bundle;
 import android.util.Log;
@@ -15,6 +13,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.etsy.android.grid.StaggeredGridView;
+
+import java.util.ArrayList;
 
 public class StaggeredGridActivity extends Activity implements AbsListView.OnScrollListener, AbsListView.OnItemClickListener, AdapterView.OnItemLongClickListener {
 
@@ -34,7 +34,7 @@ public class StaggeredGridActivity extends Activity implements AbsListView.OnScr
 
         setTitle("SGV");
         mGridView = (StaggeredGridView) findViewById(R.id.grid_view);
-
+        mGridView.setFirstItemFullWidth();
         LayoutInflater layoutInflater = getLayoutInflater();
 
         View header = layoutInflater.inflate(R.layout.list_item_header_footer, null);
