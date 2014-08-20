@@ -77,8 +77,8 @@ public abstract class ClassLoaderSavedState implements Parcelable {
         dest.writeParcelable(mSuperState, flags);
     }
 
-    public static final Parcelable.Creator<ClassLoaderSavedState> CREATOR
-            = new Parcelable.Creator<ClassLoaderSavedState>() {
+    public static final Creator<ClassLoaderSavedState> CREATOR
+            = new Creator<ClassLoaderSavedState>() {
 
         public ClassLoaderSavedState createFromParcel(Parcel in) {
             Parcelable superState = in.readParcelable(null);

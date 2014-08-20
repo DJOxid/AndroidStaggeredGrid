@@ -23,14 +23,30 @@ import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Parcel;
 import android.os.Parcelable;
+import android.os.SystemClock;
 import android.support.v4.util.SparseArrayCompat;
 import android.support.v4.view.MotionEventCompat;
 import android.support.v4.view.ViewCompat;
 import android.util.AttributeSet;
 import android.util.Log;
-import android.view.*;
+import android.util.LongSparseArray;
+import android.util.SparseBooleanArray;
+import android.util.StateSet;
+import android.view.ActionMode;
+import android.view.ContextMenu;
+import android.view.HapticFeedbackConstants;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.MotionEvent;
+import android.view.VelocityTracker;
+import android.view.View;
+import android.view.ViewConfiguration;
+import android.view.ViewDebug;
+import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.widget.AbsListView;
 import android.widget.AdapterView;
+import android.widget.Checkable;
 import android.widget.ListAdapter;
 import android.widget.Scroller;
 
@@ -61,7 +77,7 @@ public abstract class ExtendableListView extends AbsListView {
 
     private static final String TAG = "ExtendableListView";
 
-    private static final boolean DBG = false;
+    private static final boolean DBG = true;
 
     private static final int TOUCH_MODE_IDLE = 0;
     private static final int TOUCH_MODE_SCROLLING = 1;
@@ -72,12 +88,15 @@ public abstract class ExtendableListView extends AbsListView {
 
     private static final int INVALID_POINTER = -1;
 
-    // Layout using our default existing state
-    private static final int LAYOUT_NORMAL = 0;
-    // Layout from the first item down
-    private static final int LAYOUT_FORCE_TOP = 1;
     // Layout from the saved instance state data
     private static final int LAYOUT_SYNC = 2;
+
+    /**
+     * How many positions in either direction we will search to try to
+     * find a checked item with a stable ID that moved position across
+     * a data set change. If the item isn't found it will be unselected.
+     */
+    private static final int CHECK_POSITION_SEARCH_DISTANCE = 20;
 
     private int mLayoutMode;
 
@@ -112,12 +131,39 @@ public abstract class ExtendableListView extends AbsListView {
     private int mLastY;
 
     private int mActivePointerId = INVALID_POINTER;
+    /**
+     * Running state of which positions are currently checked
+     */
+    SparseBooleanArray mCheckStates;
+    /**
+     * The position within the adapter's data set of the currently selected item.
+     */
+    @ViewDebug.ExportedProperty (category = "list")
+    int mSelectedPosition = INVALID_POSITION;
+
+    /**
+     * The item id of the currently selected item.
+     */
+    long mSelectedRowId = INVALID_ROW_ID;
+
+    /**
+     * The last selected position we used when notifying
+     */
+    int mOldSelectedPosition = INVALID_POSITION;
+
+    /**
+     * The id of the last selected position we used when notifying
+     */
+    long mOldSelectedRowId = INVALID_ROW_ID;
 
     protected int mFirstPosition;
 
     // are we attached to a window - we shouldn't handle any touch events if we're not!
     private boolean mIsAttached;
-
+    /**
+     * Controls if/how the user may choose/check items in the list
+     */
+    int mChoiceMode = CHOICE_MODE_NONE;
     /**
      * When set to true, calls to requestLayout() will not propagate up the parent hierarchy.
      * This is used to layout the children during a layout pass.
@@ -139,9 +185,119 @@ public abstract class ExtendableListView extends AbsListView {
 
     protected boolean mClipToPadding;
     private PerformClick mPerformClick;
-    
+
     private Runnable mPendingCheckForTap;
     private CheckForLongPress mPendingCheckForLongPress;
+
+    /**
+     * If mAdapter != null, whenever this is true the adapter has stable IDs.
+     */
+    boolean mAdapterHasStableIds;
+    /**
+     * Running state of which IDs are currently checked.
+     * If there is a value for a given key, the checked state for that ID is true
+     * and the value holds the last known position in the adapter for that id.
+     */
+    LongSparseArray<Integer> mCheckedIdStates;
+
+    /**
+     * Controls CHOICE_MODE_MULTIPLE_MODAL. null when inactive.
+     */
+    private ActionMode mChoiceActionMode;
+    /**
+     * Wrapper for the multiple choice mode callback; AbsListView needs to perform
+     * a few extra actions around what application code does.
+     */
+    MultiChoiceModeWrapper mMultiChoiceModeCallback;
+    /**
+     * Running count of how many items are currently checked
+     */
+    int mCheckedItemCount;
+    private OnItemLongClickListener mOnItemLongClickListener;
+    private ContextMenu.ContextMenuInfo mContextMenuInfo;
+    private int mLastHandledItemCount;
+    /**
+     * The data set used to store unused views that should be reused during the next layout
+     * to avoid creating new ones
+     */
+    final RecycleBin mRecycler = new RecycleBin();
+    /**
+     * The saved state that we will be restoring from when we next sync.
+     * Kept here so that if we happen to be asked to save our state before
+     * the sync happens, we can return this existing data rather than losing
+     * it.
+     */
+    private StaggeredGridView.GridListSavedState mPendingSync;
+    private int mTranscriptMode;
+    /**
+     * Regular layout - usually an unsolicited layout from the view system
+     */
+    static final int LAYOUT_NORMAL = 0;
+
+    /**
+     * Show the first item
+     */
+    static final int LAYOUT_FORCE_TOP = 1;
+
+    /**
+     * Force the selected item to be on somewhere on the screen
+     */
+    static final int LAYOUT_SET_SELECTION = 2;
+
+    /**
+     * Show the last item
+     */
+    static final int LAYOUT_FORCE_BOTTOM = 3;
+    private boolean mForceTranscriptScroll;
+    private int mSyncMode;
+    /**
+     * Sync based on the selected child
+     */
+    static final int SYNC_SELECTED_POSITION = 0;
+
+    /**
+     * Sync based on the first child displayed
+     */
+    static final int SYNC_FIRST_POSITION = 1;
+
+    /**
+     * Maximum amount of time to spend in {@link #findSyncPosition()}
+     */
+    static final int SYNC_MAX_DURATION_MILLIS = 100;
+    /**
+     * The position to resurrect the selected position to.
+     */
+    int mResurrectToPosition = INVALID_POSITION;
+
+    private boolean mStackFromBottom;
+    /**
+     * The position within the adapter's data set of the item to select
+     * during the next layout.
+     */
+    @ViewDebug.ExportedProperty (category = "list")
+    int mNextSelectedPosition = INVALID_POSITION;
+
+    /**
+     * The item id of the item to select during the next layout.
+     */
+    long mNextSelectedRowId = INVALID_ROW_ID;
+    /**
+     * The current position of the selector in the list.
+     */
+    int mSelectorPosition = INVALID_POSITION;
+    private Runnable mClearScrollingCache;
+    private boolean mCachingStarted;
+    private boolean mCachingActive;
+    /**
+     * Indicates that we are not in the middle of a touch gesture
+     */
+    static final int TOUCH_MODE_REST = -1;
+    /**
+     * Make a mSelectedItem appear in a specific location and build the rest of
+     * the views from there. The top is specified by mSpecificTop.
+     */
+    static final int LAYOUT_SPECIFIC = 4;
+
 
     private class CheckForLongPress extends WindowRunnnable implements Runnable {
         public void run() {
@@ -165,6 +321,26 @@ public abstract class ExtendableListView extends AbsListView {
 
             }
         }
+    }
+
+    @Override
+    public void clearChoices() {
+        if (mCheckStates != null) {
+            mCheckStates.clear();
+        }
+        if (mCheckedIdStates != null) {
+            mCheckedIdStates.clear();
+        }
+        mCheckedItemCount = 0;
+    }
+
+    @Override
+    public boolean isItemChecked(int position) {
+        if (mChoiceMode != CHOICE_MODE_NONE && mCheckStates != null) {
+            return mCheckStates.get(position);
+        }
+
+        return false;
     }
 
     /**
@@ -247,12 +423,206 @@ public abstract class ExtendableListView extends AbsListView {
 
     @Override
     protected void onFocusChanged(boolean gainFocus, int direction, Rect previouslyFocusedRect) {
-        // TODO : handle focus and its impact on selection - if we add item selection support
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect);
+        if (gainFocus && mSelectedPosition < 0 && !isInTouchMode()) {
+            if (!isAttachedToWindow() && mAdapter != null) {
+                // Data may have changed while we were detached and it's valid
+                // to change focus while detached. Refresh so we don't die.
+                mDataChanged = true;
+                mOldItemCount = mItemCount;
+                mItemCount = mAdapter.getCount();
+            }
+            resurrectSelection();
+        }
+    }
+
+    /**
+     * Attempt to bring the selection back if the user is switching from touch
+     * to trackball mode
+     *
+     * @return Whether selection was set to something.
+     */
+    boolean resurrectSelection() {
+        final int childCount = getChildCount();
+
+        if (childCount <= 0) {
+            return false;
+        }
+
+        int selectedTop = 0;
+        int selectedPos;
+        int childrenTop = getListPaddingTop();
+        int childrenBottom = mBottom - mTop - getListPaddingBottom();
+        final int firstPosition = mFirstPosition;
+        final int toPosition = mResurrectToPosition;
+        boolean down = true;
+
+        if (toPosition >= firstPosition && toPosition < firstPosition + childCount) {
+            selectedPos = toPosition;
+
+            final View selected = getChildAt(selectedPos - mFirstPosition);
+            selectedTop = selected.getTop();
+            int selectedBottom = selected.getBottom();
+
+            // We are scrolled, don't get in the fade
+            if (selectedTop < childrenTop) {
+                selectedTop = childrenTop + getVerticalFadingEdgeLength();
+            } else if (selectedBottom > childrenBottom) {
+                selectedTop = childrenBottom - selected.getMeasuredHeight()
+                        - getVerticalFadingEdgeLength();
+            }
+        } else {
+            if (toPosition < firstPosition) {
+                // Default to selecting whatever is first
+                selectedPos = firstPosition;
+                for (int i = 0; i < childCount; i++) {
+                    final View v = getChildAt(i);
+                    final int top = v.getTop();
+
+                    if (i == 0) {
+                        // Remember the position of the first item
+                        selectedTop = top;
+                        // See if we are scrolled at all
+                        if (firstPosition > 0 || top < childrenTop) {
+                            // If we are scrolled, don't select anything that is
+                            // in the fade region
+                            childrenTop += getVerticalFadingEdgeLength();
+                        }
+                    }
+                    if (top >= childrenTop) {
+                        // Found a view whose top is fully visisble
+                        selectedPos = firstPosition + i;
+                        selectedTop = top;
+                        break;
+                    }
+                }
+            } else {
+                final int itemCount = mItemCount;
+                down = false;
+                selectedPos = firstPosition + childCount - 1;
+
+                for (int i = childCount - 1; i >= 0; i--) {
+                    final View v = getChildAt(i);
+                    final int top = v.getTop();
+                    final int bottom = v.getBottom();
+
+                    if (i == childCount - 1) {
+                        selectedTop = top;
+                        if (firstPosition + childCount < itemCount || bottom > childrenBottom) {
+                            childrenBottom -= getVerticalFadingEdgeLength();
+                        }
+                    }
+
+                    if (bottom <= childrenBottom) {
+                        selectedPos = firstPosition + i;
+                        selectedTop = top;
+                        break;
+                    }
+                }
+            }
+        }
+
+        mResurrectToPosition = INVALID_POSITION;
+        removeCallbacks(mFlingRunnable);
+//        if (mPositionScroller != null) {
+//            mPositionScroller.stop();
+//        }
+        mTouchMode = TOUCH_MODE_REST;
+        clearScrollingCache();
+        mSpecificTop = selectedTop;
+        selectedPos = lookForSelectablePosition(selectedPos, down);
+        if (selectedPos >= firstPosition && selectedPos <= getLastVisiblePosition()) {
+            mLayoutMode = LAYOUT_SPECIFIC;
+            updateSelectorState();
+            setSelectionInt(selectedPos);
+            invokeOnItemScrollListener();
+        } else {
+            selectedPos = INVALID_POSITION;
+        }
+        reportScrollStateChange(OnScrollListener.SCROLL_STATE_IDLE);
+
+        return selectedPos >= 0;
     }
 
     @Override
     public void onWindowFocusChanged(boolean hasWindowFocus) {
+        super.onWindowFocusChanged(hasWindowFocus);
         // TODO : handle focus and its impact on selection - if we add item selection support
+    }
+
+    /**
+     * Makes the item at the supplied position selected.
+     *
+     * @param position the position of the item to select
+     */
+    void setSelectionInt(int position) {
+        setNextSelectedPositionInt(position);
+        boolean awakeScrollbars = false;
+
+        final int selectedPosition = mSelectedPosition;
+
+        if (selectedPosition >= 0) {
+            if (position == selectedPosition - 1) {
+                awakeScrollbars = true;
+            } else if (position == selectedPosition + 1) {
+                awakeScrollbars = true;
+            }
+        }
+
+//        if (mPositionScroller != null) {
+//            mPositionScroller.stop();
+//        }
+
+        layoutChildren();
+
+        if (awakeScrollbars) {
+            awakenScrollBars();
+        }
+    }
+
+    /**
+     * Indicates whether this view is in a state where the selector should be drawn. This will
+     * happen if we have focus but are not in touch mode, or we are in the middle of displaying
+     * the pressed state for an item.
+     *
+     * @return True if the selector should be shown
+     */
+    boolean shouldShowSelector() {
+        //TODO check this method
+        return (!isInTouchMode()) || isPressed();
+    }
+
+    void updateSelectorState() {
+        if (getSelector() != null) {
+            if (shouldShowSelector()) {
+                getSelector().setState(getDrawableState());
+            } else {
+                getSelector().setState(StateSet.NOTHING);
+            }
+        }
+    }
+
+    private void clearScrollingCache() {
+        if (!isHardwareAccelerated()) {
+            if (mClearScrollingCache == null) {
+                mClearScrollingCache = new Runnable() {
+                    @Override
+                    public void run() {
+                        if (mCachingStarted) {
+                            mCachingStarted = mCachingActive = false;
+                            setChildrenDrawnWithCacheEnabled(false);
+                            if ((getPersistentDrawingCache() & PERSISTENT_SCROLLING_CACHE) == 0) {
+                                setChildrenDrawingCacheEnabled(false);
+                            }
+                            if (!isAlwaysDrawnWithCacheEnabled()) {
+                                invalidate();
+                            }
+                        }
+                    }
+                };
+            }
+            post(mClearScrollingCache);
+        }
     }
 
     @Override
@@ -261,7 +631,7 @@ public abstract class ExtendableListView extends AbsListView {
     }
 
     protected void onSizeChanged(int w, int h) {
-    	if (getChildCount() > 0) {
+        if (getChildCount() > 0) {
             stopFlingRunnable();
             mRecycleBin.clear();
             mDataChanged = true;
@@ -287,9 +657,9 @@ public abstract class ExtendableListView extends AbsListView {
         // use a wrapper list adapter if we have a header or footer
         if (mHeaderViewInfos.size() > 0 || mFooterViewInfos.size() > 0) {
             mAdapter = new HeaderViewListAdapter(mHeaderViewInfos, mFooterViewInfos, adapter);
-        }
-        else {
+        } else {
             mAdapter = adapter;
+
         }
 
         mDataChanged = true;
@@ -300,6 +670,21 @@ public abstract class ExtendableListView extends AbsListView {
             mRecycleBin.setViewTypeCount(mAdapter.getViewTypeCount());
         }
 
+        if (adapter != null) {
+            mAdapterHasStableIds = mAdapter.hasStableIds();
+            if (mChoiceMode != CHOICE_MODE_NONE && mAdapterHasStableIds &&
+                    mCheckedIdStates == null) {
+                mCheckedIdStates = new LongSparseArray<Integer>();
+            }
+        }
+
+        if (mCheckStates != null) {
+            mCheckStates.clear();
+        }
+
+        if (mCheckedIdStates != null) {
+            mCheckedIdStates.clear();
+        }
         requestLayout();
     }
 
@@ -314,8 +699,12 @@ public abstract class ExtendableListView extends AbsListView {
 
     @Override
     public View getSelectedView() {
-        if (DBG) Log.e(TAG, "getSelectedView() is not supported in ExtendableListView yet");
-        return null;
+//        if (DBG) Log.e(TAG, "getSelectedView() is not supported in ExtendableListView yet");
+        if (mItemCount > 0 && mSelectedPosition >= 0) {
+            return getChildAt(mSelectedPosition - mFirstPosition);
+        } else {
+            return null;
+        }
     }
 
     @Override
@@ -331,6 +720,131 @@ public abstract class ExtendableListView extends AbsListView {
             }
             requestLayout();
         }
+    }
+
+    @Override
+    public void setItemChecked(int position, boolean value) {
+        if (mChoiceMode == CHOICE_MODE_NONE) {
+            return;
+        }
+
+        // Start selection mode if needed. We don't need to if we're unchecking something.
+        if (value && mChoiceMode == CHOICE_MODE_MULTIPLE_MODAL && mChoiceActionMode == null) {
+            if (mMultiChoiceModeCallback == null ||
+                    !mMultiChoiceModeCallback.hasWrappedCallback()) {
+                throw new IllegalStateException("AbsListView: attempted to start selection mode " +
+                        "for CHOICE_MODE_MULTIPLE_MODAL but no choice mode callback was " +
+                        "supplied. Call setMultiChoiceModeListener to set a callback.");
+            }
+            mChoiceActionMode = startActionMode(mMultiChoiceModeCallback);
+        }
+
+        if (mChoiceMode == CHOICE_MODE_MULTIPLE || mChoiceMode == CHOICE_MODE_MULTIPLE_MODAL) {
+            boolean oldValue = mCheckStates.get(position);
+            mCheckStates.put(position, value);
+            if (mCheckedIdStates != null && mAdapter.hasStableIds()) {
+                if (value) {
+                    mCheckedIdStates.put(mAdapter.getItemId(position), position);
+                } else {
+                    mCheckedIdStates.delete(mAdapter.getItemId(position));
+                }
+            }
+            if (oldValue != value) {
+                if (value) {
+                    mCheckedItemCount++;
+                } else {
+                    mCheckedItemCount--;
+                }
+            }
+            if (mChoiceActionMode != null) {
+                final long id = mAdapter.getItemId(position);
+                mMultiChoiceModeCallback.onItemCheckedStateChanged(mChoiceActionMode,
+                        position, id, value);
+            }
+        } else {
+            boolean updateIds = mCheckedIdStates != null && mAdapter.hasStableIds();
+            // Clear all values if we're checking something, or unchecking the currently
+            // selected item
+            if (value || isItemChecked(position)) {
+                mCheckStates.clear();
+                if (updateIds) {
+                    mCheckedIdStates.clear();
+                }
+            }
+            // this may end up selecting the value we just cleared but this way
+            // we ensure length of mCheckStates is 1, a fact getCheckedItemPosition relies on
+            if (value) {
+                mCheckStates.put(position, true);
+                if (updateIds) {
+                    mCheckedIdStates.put(mAdapter.getItemId(position), position);
+                }
+                mCheckedItemCount = 1;
+            } else if (mCheckStates.size() == 0 || !mCheckStates.valueAt(0)) {
+                mCheckedItemCount = 0;
+            }
+        }
+
+        // Do not generate a data change while we are in the layout phase
+        if (!mInLayout && !mBlockLayoutRequests) {
+//            if (mCheckedIdStates != null && mCheckedIdStates.size() > 0) {
+//                updateOnScreenCheckedViews();
+//            }
+
+            mDataChanged = true;
+            rememberSyncState();
+            requestLayout();
+        }
+    }
+
+    @Override
+    public void setOnItemLongClickListener(OnItemLongClickListener listener) {
+        super.setOnItemLongClickListener(listener);
+        mOnItemLongClickListener = listener;
+    }
+
+    public SparseBooleanArray getCheckedItemPositions() {
+        if (mChoiceMode != CHOICE_MODE_NONE) {
+            return mCheckStates;
+        }
+        return null;
+    }
+
+    @Override
+    public void setChoiceMode(int choiceMode) {
+        mChoiceMode = choiceMode;
+        if (mChoiceActionMode != null) {
+            mChoiceActionMode.finish();
+            mChoiceActionMode = null;
+        }
+        if (mChoiceMode != CHOICE_MODE_NONE) {
+            if (mCheckStates == null) {
+                mCheckStates = new SparseBooleanArray(0);
+            }
+            if (mCheckedIdStates == null && mAdapter != null && mAdapter.hasStableIds()) {
+                mCheckedIdStates = new LongSparseArray<Integer>(0);
+            }
+            // Modal multi-choice mode only has choices when the mode is active. Clear them.
+            if (mChoiceMode == CHOICE_MODE_MULTIPLE_MODAL) {
+                clearChoices();
+                setLongClickable(true);
+            }
+        }
+    }
+
+    /**
+     * @return The current choice mode
+     * @see #setChoiceMode(int)
+     */
+    public int getChoiceMode() {
+        return mChoiceMode;
+    }
+
+    @Override
+    public void setMultiChoiceModeListener(MultiChoiceModeListener listener) {
+        if (mMultiChoiceModeCallback == null) {
+            mMultiChoiceModeCallback = new MultiChoiceModeWrapper();
+        }
+        mMultiChoiceModeCallback.setWrapped(listener);
     }
 
     // //////////////////////////////////////////////////////////////////////////////////////////
@@ -582,8 +1096,7 @@ public abstract class ExtendableListView extends AbsListView {
                 clearState();
                 invokeOnItemScrollListener();
                 return;
-            }
-            else if (mItemCount != mAdapter.getCount()) {
+            } else if (mItemCount != mAdapter.getCount()) {
                 throw new IllegalStateException("The content of the adapter has changed but "
                         + "ExtendableListView did not receive a notification. Make sure the content of "
                         + "your adapter is not modified from a background thread, but only "
@@ -600,8 +1113,7 @@ public abstract class ExtendableListView extends AbsListView {
                 for (int i = 0; i < childCount; i++) {
                     recycleBin.addScrapView(getChildAt(i), firstPosition + i);
                 }
-            }
-            else {
+            } else {
                 recycleBin.fillActiveViews(childCount, firstPosition);
             }
 
@@ -626,12 +1138,10 @@ public abstract class ExtendableListView extends AbsListView {
                 default: {
                     if (childCount == 0) {
                         fillFromTop(childrenTop);
-                    }
-                    else if (mFirstPosition < mItemCount) {
+                    } else if (mFirstPosition < mItemCount) {
                         fillSpecific(mFirstPosition,
                                 oldFirst == null ? childrenTop : oldFirst.getTop());
-                    }
-                    else {
+                    } else {
                         fillSpecific(0, childrenTop);
                     }
                     break;
@@ -652,24 +1162,269 @@ public abstract class ExtendableListView extends AbsListView {
 
     @Override
     protected void handleDataChanged() {
-        super.handleDataChanged();
+//        super.handleDataChanged();
 
-        final int count = mItemCount;
+        int count = mItemCount;
+        int lastHandledItemCount = mLastHandledItemCount;
+        mLastHandledItemCount = mItemCount;
 
-        if (count > 0 && mNeedSync) {
-            mNeedSync = false;
-            mSyncState = null;
-
-            mLayoutMode = LAYOUT_SYNC;
-            mSyncPosition = Math.min(Math.max(0, mSyncPosition), count - 1);
-            return;
+        if (mChoiceMode != CHOICE_MODE_NONE && mAdapter != null && mAdapter.hasStableIds()) {
+            confirmCheckedPositionsById();
         }
 
-        mLayoutMode = LAYOUT_FORCE_TOP;
-        mNeedSync = false;
-        mSyncState = null;
+        // TODO: In the future we can recycle these views based on stable ID instead.
+        mRecycler.clearTransientStateViews();
 
-        // TODO : add selection handling here
+        if (count > 0) {
+            int newPos;
+            int selectablePos;
+
+            // Find the row we are supposed to sync to
+            if (mNeedSync) {
+                // Update this first, since setNextSelectedPositionInt inspects it
+                mNeedSync = false;
+                mPendingSync = null;
+
+                if (mTranscriptMode == TRANSCRIPT_MODE_ALWAYS_SCROLL) {
+                    mLayoutMode = LAYOUT_FORCE_BOTTOM;
+                    return;
+                } else if (mTranscriptMode == TRANSCRIPT_MODE_NORMAL) {
+                    if (mForceTranscriptScroll) {
+                        mForceTranscriptScroll = false;
+                        mLayoutMode = LAYOUT_FORCE_BOTTOM;
+                        return;
+                    }
+                    final int childCount = getChildCount();
+                    final int listBottom = getHeight() - getPaddingBottom();
+                    final View lastChild = getChildAt(childCount - 1);
+                    final int lastBottom = lastChild != null ? lastChild.getBottom() : listBottom;
+                    if (mFirstPosition + childCount >= lastHandledItemCount &&
+                            lastBottom <= listBottom) {
+                        mLayoutMode = LAYOUT_FORCE_BOTTOM;
+                        return;
+                    }
+                    // Something new came in and we didn't scroll; give the user a clue that
+                    // there's something new.
+                    awakenScrollBars();
+                }
+
+                switch (mSyncMode) {
+                    case SYNC_SELECTED_POSITION:
+                        if (isInTouchMode()) {
+                            // We saved our state when not in touch mode. (We know this because
+                            // mSyncMode is SYNC_SELECTED_POSITION.) Now we are trying to
+                            // restore in touch mode. Just leave mSyncPosition as it is (possibly
+                            // adjusting if the available range changed) and return.
+                            mLayoutMode = LAYOUT_SYNC;
+                            mSyncPosition = Math.min(Math.max(0, mSyncPosition), count - 1);
+
+                            return;
+                        } else {
+                            // See if we can find a position in the new data with the same
+                            // id as the old selection. This will change mSyncPosition.
+                            newPos = findSyncPosition();
+                            if (newPos >= 0) {
+                                // Found it. Now verify that new selection is still selectable
+                                selectablePos = lookForSelectablePosition(newPos, true);
+                                if (selectablePos == newPos) {
+                                    // Same row id is selected
+                                    mSyncPosition = newPos;
+
+                                    if (mSyncHeight == getHeight()) {
+                                        // If we are at the same height as when we saved state, try
+                                        // to restore the scroll position too.
+                                        mLayoutMode = LAYOUT_SYNC;
+                                    } else {
+                                        // We are not the same height as when the selection was saved, so
+                                        // don't try to restore the exact position
+                                        mLayoutMode = LAYOUT_SET_SELECTION;
+                                    }
+
+                                    // Restore selection
+                                    setNextSelectedPositionInt(newPos);
+                                    return;
+                                }
+                            }
+                        }
+                        break;
+                    case SYNC_FIRST_POSITION:
+                        // Leave mSyncPosition as it is -- just pin to available range
+                        mLayoutMode = LAYOUT_SYNC;
+                        mSyncPosition = Math.min(Math.max(0, mSyncPosition), count - 1);
+
+                        return;
+                }
+            }
+
+            if (!isInTouchMode()) {
+                // We couldn't find matching data -- try to use the same position
+                newPos = getSelectedItemPosition();
+
+                // Pin position to the available range
+                if (newPos >= count) {
+                    newPos = count - 1;
+                }
+                if (newPos < 0) {
+                    newPos = 0;
+                }
+
+                // Make sure we select something selectable -- first look down
+                selectablePos = lookForSelectablePosition(newPos, true);
+
+                if (selectablePos >= 0) {
+                    setNextSelectedPositionInt(selectablePos);
+                    return;
+                } else {
+                    // Looking down didn't work -- try looking up
+                    selectablePos = lookForSelectablePosition(newPos, false);
+                    if (selectablePos >= 0) {
+                        setNextSelectedPositionInt(selectablePos);
+                        return;
+                    }
+                }
+            } else {
+
+                // We already know where we want to resurrect the selection
+                if (mResurrectToPosition >= 0) {
+                    return;
+                }
+            }
+
+        }
+
+        // Nothing is selected. Give up and reset everything.
+        mLayoutMode = mStackFromBottom ? LAYOUT_FORCE_BOTTOM : LAYOUT_FORCE_TOP;
+        mSelectedPosition = INVALID_POSITION;
+        mSelectedRowId = INVALID_ROW_ID;
+        mNextSelectedPosition = INVALID_POSITION;
+        mNextSelectedRowId = INVALID_ROW_ID;
+        mNeedSync = false;
+        mPendingSync = null;
+        mSelectorPosition = INVALID_POSITION;
+        checkSelectionChanged();
+    }
+
+    void checkSelectionChanged() {
+        if ((mSelectedPosition != mOldSelectedPosition) || (mSelectedRowId != mOldSelectedRowId)) {
+//            selectionChanged();
+            mOldSelectedPosition = mSelectedPosition;
+            mOldSelectedRowId = mSelectedRowId;
+        }
+    }
+
+    /**
+     * Utility to keep mNextSelectedPosition and mNextSelectedRowId in sync
+     *
+     * @param position Intended value for mSelectedPosition the next time we go
+     *                 through layout
+     */
+    void setNextSelectedPositionInt(int position) {
+        mNextSelectedPosition = position;
+        mNextSelectedRowId = getItemIdAtPosition(position);
+        // If we are trying to sync to the selection, update that too
+        if (mNeedSync && mSyncMode == SYNC_SELECTED_POSITION && position >= 0) {
+            mSyncPosition = position;
+            mSyncRowId = mNextSelectedRowId;
+        }
+    }
+
+    /**
+     * Find a position that can be selected (i.e., is not a separator).
+     *
+     * @param position The starting position to look at.
+     * @param lookDown Whether to look down for other positions.
+     * @return The next selectable position starting at position and then searching either up or
+     * down. Returns {@link #INVALID_POSITION} if nothing can be found.
+     */
+    int lookForSelectablePosition(int position, boolean lookDown) {
+        return position;
+    }
+
+    /**
+     * Searches the adapter for a position matching mSyncRowId. The search starts at mSyncPosition
+     * and then alternates between moving up and moving down until 1) we find the right position, or
+     * 2) we run out of time, or 3) we have looked at every position
+     *
+     * @return Position of the row that matches mSyncRowId, or {@link #INVALID_POSITION} if it can't
+     * be found
+     */
+    int findSyncPosition() {
+        int count = mItemCount;
+
+        if (count == 0) {
+            return INVALID_POSITION;
+        }
+
+        long idToMatch = mSyncRowId;
+        int seed = mSyncPosition;
+
+        // If there isn't a selection don't hunt for it
+        if (idToMatch == INVALID_ROW_ID) {
+            return INVALID_POSITION;
+        }
+
+        // Pin seed to reasonable values
+        seed = Math.max(0, seed);
+        seed = Math.min(count - 1, seed);
+
+        long endTime = SystemClock.uptimeMillis() + SYNC_MAX_DURATION_MILLIS;
+
+        long rowId;
+
+        // first position scanned so far
+        int first = seed;
+
+        // last position scanned so far
+        int last = seed;
+
+        // True if we should move down on the next iteration
+        boolean next = false;
+
+        // True when we have looked at the first item in the data
+        boolean hitFirst;
+
+        // True when we have looked at the last item in the data
+        boolean hitLast;
+
+        // Get the item ID locally (instead of getItemIdAtPosition), so
+        // we need the adapter
+        ListAdapter adapter = getAdapter();
+        if (adapter == null) {
+            return INVALID_POSITION;
+        }
+
+        while (SystemClock.uptimeMillis() <= endTime) {
+            rowId = adapter.getItemId(seed);
+            if (rowId == idToMatch) {
+                // Found it!
+                return seed;
+            }
+
+            hitLast = last == count - 1;
+            hitFirst = first == 0;
+
+            if (hitLast && hitFirst) {
+                // Looked at everything
+                break;
+            }
+
+            if (hitFirst || (next && !hitLast)) {
+                // Either we hit the top, or we are trying to move down
+                last++;
+                seed = last;
+                // Try going up next time
+                next = false;
+            } else if (hitLast || (!next && !hitFirst)) {
+                // Either we hit the bottom, or we are trying to move up
+                first--;
+                seed = first;
+                // Try going down next time
+                next = true;
+            }
+
+        }
+
+        return INVALID_POSITION;
     }
 
     public void resetToTop() {
@@ -703,7 +1458,7 @@ public abstract class ExtendableListView extends AbsListView {
     public boolean onTouchEvent(MotionEvent event) {
         // we're not passing this down as
         // all the touch handling is right here
-        // super.onTouchEvent(event);
+//        super.onTouchEvent(event);
 
         if (!isEnabled()) {
             // A disabled view that is clickable still consumes the touch
@@ -872,7 +1627,7 @@ public abstract class ExtendableListView extends AbsListView {
             }
         }
     }
-    
+
     private boolean onTouchDown(final MotionEvent event) {
         final int x = (int) event.getX();
         final int y = (int) event.getY();
@@ -882,8 +1637,6 @@ public abstract class ExtendableListView extends AbsListView {
         mActivePointerId = MotionEventCompat.getPointerId(event, 0);
 
         // TODO : use the motion position for fling support
-        // TODO : support long press!
-        // startLongPressCheck();
 
         if ((mTouchMode != TOUCH_MODE_FLINGING) &&
                 !mDataChanged &&
@@ -903,8 +1656,7 @@ public abstract class ExtendableListView extends AbsListView {
                 // code in ViewRoot to try to find a nearby view to select
                 return false;
             }
-        }
-        else if (mTouchMode == TOUCH_MODE_FLINGING) {
+        } else if (mTouchMode == TOUCH_MODE_FLINGING) {
             mTouchMode = TOUCH_MODE_SCROLLING;
             mMotionCorrection = 0;
             motionPosition = findMotionRow(y);
@@ -956,11 +1708,11 @@ public abstract class ExtendableListView extends AbsListView {
         setPressed(false);
         invalidate(); // redraw selector
         final Handler handler = getHandler();
-        
+
         if (handler != null) {
             handler.removeCallbacks(mPendingCheckForLongPress);
         }
-        
+
         recycleVelocityTracker();
         mActivePointerId = INVALID_POINTER;
         return true;
@@ -979,14 +1731,14 @@ public abstract class ExtendableListView extends AbsListView {
 
         setPressed(false);
         invalidate(); // redraw selector
-        
+
         final Handler handler = getHandler();
         if (handler != null) {
             handler.removeCallbacks(mPendingCheckForLongPress);
         }
-        
+
         recycleVelocityTracker();
-        
+
         mActivePointerId = INVALID_POINTER;
         return true;
     }
@@ -1029,18 +1781,18 @@ public abstract class ExtendableListView extends AbsListView {
                 if (mTouchMode != TOUCH_MODE_DOWN) {
                     child.setPressed(false);
                 }
-    
+
                 if (mPerformClick == null) {
                     invalidate();
                     mPerformClick = new PerformClick();
                 }
-    
+
                 final PerformClick performClick = mPerformClick;
                 performClick.mClickMotionPosition = motionPosition;
                 performClick.rememberWindowAttachCount();
-    
-    //            mResurrectToPosition = motionPosition;
-    
+
+                //            mResurrectToPosition = motionPosition;
+
                 if (mTouchMode == TOUCH_MODE_DOWN || mTouchMode == TOUCH_MODE_TAP) {
                     final Handler handler = getHandler();
                     if (handler != null) {
@@ -1123,8 +1875,7 @@ public abstract class ExtendableListView extends AbsListView {
         if (overscroll || distance > mTouchSlop) {
             if (overscroll) {
                 mMotionCorrection = 0;
-            }
-            else {
+            } else {
                 mTouchMode = TOUCH_MODE_SCROLLING;
                 mMotionCorrection = deltaY > 0 ? mTouchSlop : -mTouchSlop;
             }
@@ -1169,8 +1920,7 @@ public abstract class ExtendableListView extends AbsListView {
                 final int motionIndex;
                 if (mMotionPosition >= 0) {
                     motionIndex = mMotionPosition - mFirstPosition;
-                }
-                else {
+                } else {
                     // If we don't have a motion position that we can reliably track,
                     // pick something in the middle to make a best guess at things below.
                     motionIndex = getChildCount() / 2;
@@ -1219,7 +1969,8 @@ public abstract class ExtendableListView extends AbsListView {
 
     // move our views by deltaY - what's the incrementalDeltaY?
     private boolean moveTheChildren(int deltaY, int incrementalDeltaY) {
-        if (DBG) Log.d(TAG, "moveTheChildren deltaY: " + deltaY + "incrementalDeltaY: " + incrementalDeltaY);
+        if (DBG)
+            Log.d(TAG, "moveTheChildren deltaY: " + deltaY + "incrementalDeltaY: " + incrementalDeltaY);
         // there's nothing to move!
         if (!hasChildren()) return true;
 
@@ -1245,8 +1996,7 @@ public abstract class ExtendableListView extends AbsListView {
 
         if (incrementalDeltaY < 0) {
             incrementalDeltaY = Math.max(-(height - 1), incrementalDeltaY);
-        }
-        else {
+        } else {
             incrementalDeltaY = Math.min(height - 1, incrementalDeltaY);
         }
 
@@ -1299,8 +2049,7 @@ public abstract class ExtendableListView extends AbsListView {
                 final View child = getChildAt(i);
                 if (child.getBottom() >= top) {
                     break;
-                }
-                else {
+                } else {
                     count++;
                     int position = firstPosition + i;
                     if (position >= headerViewsCount && position < footerViewsStart) {
@@ -1308,8 +2057,7 @@ public abstract class ExtendableListView extends AbsListView {
                     }
                 }
             }
-        }
-        else {
+        } else {
             int bottom = gridHeight - incrementalDeltaY;
             if (mClipToPadding) {
                 bottom -= getListPaddingBottom();
@@ -1318,8 +2066,7 @@ public abstract class ExtendableListView extends AbsListView {
                 final View child = getChildAt(i);
                 if (child.getTop() <= bottom) {
                     break;
-                }
-                else {
+                } else {
                     start = i;
                     count++;
                     int position = firstPosition + i;
@@ -1381,8 +2128,7 @@ public abstract class ExtendableListView extends AbsListView {
             int position = mFirstPosition + count;
             final int startOffset = getChildTop(position);
             fillDown(position, startOffset);
-        }
-        else {
+        } else {
             // fill up from the bottom of the position above our first.
             int position = mFirstPosition - 1;
             final int startOffset = getChildBottom(position);
@@ -1394,8 +2140,7 @@ public abstract class ExtendableListView extends AbsListView {
     protected void adjustViewsAfterFillGap(boolean down) {
         if (down) {
             correctTooHigh(getChildCount());
-        }
-        else {
+        } else {
             correctTooLow(getChildCount());
         }
     }
@@ -1411,8 +2156,8 @@ public abstract class ExtendableListView extends AbsListView {
         }
 
         while ((nextTop < end || hasSpaceDown()) && pos < mItemCount) {
-            // TODO : add selection support
-            makeAndAddView(pos, nextTop, true, false);
+            boolean selected = pos == mSelectedPosition;
+            makeAndAddView(pos, nextTop, true, selected);
             pos++;
             nextTop = getNextChildDownsTop(pos); // = child.getBottom();
         }
@@ -1420,7 +2165,7 @@ public abstract class ExtendableListView extends AbsListView {
         return selectedView;
     }
 
-    /***
+    /**
      * Override to tell filling flow to continue to fill up as we have space.
      */
     protected boolean hasSpaceDown() {
@@ -1434,8 +2179,8 @@ public abstract class ExtendableListView extends AbsListView {
         int end = mClipToPadding ? getListPaddingTop() : 0;
 
         while ((nextBottom > end || hasSpaceUp()) && pos >= 0) {
-            // TODO : add selection support
-            makeAndAddView(pos, nextBottom, false, false);
+            boolean selected = pos == mSelectedPosition;
+            makeAndAddView(pos, nextBottom, false, selected);
             pos--;
             nextBottom = getNextChildUpsBottom(pos);
             if (DBG) Log.d(TAG, "fillUp next - position:" + pos + " nextBottom:" + nextBottom);
@@ -1445,7 +2190,7 @@ public abstract class ExtendableListView extends AbsListView {
         return selectedView;
     }
 
-    /***
+    /**
      * Override to tell filling flow to continue to fill up as we have space.
      */
     protected boolean hasSpaceUp() {
@@ -1474,7 +2219,8 @@ public abstract class ExtendableListView extends AbsListView {
      * visible area.
      */
     private View fillSpecific(int position, int top) {
-        boolean tempIsSelected = false; // ain't no body got time for that @ Etsy
+        boolean tempIsSelected = position == mSelectedPosition;
+        // ain't no body got time for that @ Etsy
         View temp = makeAndAddView(position, top, true, tempIsSelected);
         // Possibly changed again in fillUp if we add rows above this one.
         mFirstPosition = position;
@@ -1496,11 +2242,9 @@ public abstract class ExtendableListView extends AbsListView {
 
         if (tempIsSelected) {
             return temp;
-        }
-        else if (above != null) {
+        } else if (above != null) {
             return above;
-        }
-        else {
+        } else {
             return below;
         }
     }
@@ -1544,11 +2288,10 @@ public abstract class ExtendableListView extends AbsListView {
      *                 edge to y.
      * @param selected Is this position selected?
      * @param recycled Has this view been pulled from the recycle bin? If so it
-     *                 does not need to be remeasured.
      */
     private void setupChild(View child, int position, int y, boolean flowDown,
                             boolean selected, boolean recycled) {
-        final boolean isSelected = false; // TODO : selected && shouldShowSelector();
+        final boolean isSelected = selected && shouldShowSelector();
         final boolean updateChildSelected = isSelected != child.isSelected();
         final int mode = mTouchMode;
         final boolean isPressed = mode > TOUCH_MODE_DOWN && mode < TOUCH_MODE_SCROLLING &&
@@ -1561,8 +2304,7 @@ public abstract class ExtendableListView extends AbsListView {
         LayoutParams layoutParams;
         if (itemViewType == ITEM_VIEW_TYPE_HEADER_OR_FOOTER) {
             layoutParams = generateWrapperLayoutParams(child);
-        }
-        else {
+        } else {
             layoutParams = generateChildLayoutParams(child);
         }
 
@@ -1573,8 +2315,7 @@ public abstract class ExtendableListView extends AbsListView {
                 layoutParams.viewType == AdapterView.ITEM_VIEW_TYPE_HEADER_OR_FOOTER)) {
             if (DBG) Log.d(TAG, "setupChild attachViewToParent position:" + position);
             attachViewToParent(child, flowDown ? -1 : 0, layoutParams);
-        }
-        else {
+        } else {
             if (DBG) Log.d(TAG, "setupChild addViewInLayout position:" + position);
             if (layoutParams.viewType == AdapterView.ITEM_VIEW_TYPE_HEADER_OR_FOOTER) {
                 layoutParams.recycledHeaderFooter = true;
@@ -1590,11 +2331,19 @@ public abstract class ExtendableListView extends AbsListView {
             child.setPressed(isPressed);
         }
 
+        if (mChoiceMode != CHOICE_MODE_NONE && mCheckStates != null) {
+            if (child instanceof Checkable) {
+                ((Checkable) child).setChecked(mCheckStates.get(position));
+            } else if (getContext().getApplicationInfo().targetSdkVersion
+                    >= android.os.Build.VERSION_CODES.HONEYCOMB) {
+                child.setActivated(mCheckStates.get(position));
+            }
+        }
+
         if (needToMeasure) {
             if (DBG) Log.d(TAG, "setupChild onMeasureChild position:" + position);
             onMeasureChild(child, layoutParams);
-        }
-        else {
+        } else {
             if (DBG) Log.d(TAG, "setupChild cleanupLayoutState position:" + position);
             cleanupLayoutState(child);
         }
@@ -1613,11 +2362,9 @@ public abstract class ExtendableListView extends AbsListView {
             final int childRight = childrenLeft + w;
             final int childBottom = childTop + h;
             onLayoutChild(child, position, flowDown, childrenLeft, childTop, childRight, childBottom);
-        }
-        else {
+        } else {
             onOffsetChild(child, position, flowDown, childrenLeft, childTop);
         }
-
     }
 
     protected LayoutParams generateChildLayoutParams(final View child) {
@@ -1631,8 +2378,7 @@ public abstract class ExtendableListView extends AbsListView {
         if (childParams != null) {
             if (childParams instanceof LayoutParams) {
                 layoutParams = (LayoutParams) childParams;
-            }
-            else {
+            } else {
                 layoutParams = new LayoutParams(childParams);
             }
         }
@@ -1654,8 +2400,7 @@ public abstract class ExtendableListView extends AbsListView {
         int childHeightSpec;
         if (lpHeight > 0) {
             childHeightSpec = MeasureSpec.makeMeasureSpec(lpHeight, MeasureSpec.EXACTLY);
-        }
-        else {
+        } else {
             childHeightSpec = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED);
         }
         child.measure(childWidthSpec, childHeightSpec);
@@ -1695,12 +2440,10 @@ public abstract class ExtendableListView extends AbsListView {
 
             if (child != scrapView) {
                 mRecycleBin.addScrapView(scrapView, position);
-            }
-            else {
+            } else {
                 isScrap[0] = true;
             }
-        }
-        else {
+        } else {
             if (DBG) Log.d(TAG, "getView position:" + position);
             child = mAdapter.getView(position, null, this);
         }
@@ -1802,8 +2545,7 @@ public abstract class ExtendableListView extends AbsListView {
                         // Close up the remaining gap
                         adjustViewsUpOrDown();
                     }
-                }
-                else if (lastPosition == mItemCount - 1) {
+                } else if (lastPosition == mItemCount - 1) {
                     adjustViewsUpOrDown();
                 }
             }
@@ -1958,8 +2700,7 @@ public abstract class ExtendableListView extends AbsListView {
     private void initOrResetVelocityTracker() {
         if (mVelocityTracker == null) {
             mVelocityTracker = VelocityTracker.obtain();
-        }
-        else {
+        } else {
             mVelocityTracker.clear();
         }
     }
@@ -1984,7 +2725,7 @@ public abstract class ExtendableListView extends AbsListView {
         mFlingRunnable.start((int) -velocity);
     }
 
-    private void stopFlingRunnable() {
+    protected void stopFlingRunnable() {
         if (mFlingRunnable != null) {
             mFlingRunnable.endFling();
         }
@@ -2066,8 +2807,7 @@ public abstract class ExtendableListView extends AbsListView {
                         mMotionPosition = mFirstPosition;
                         // Don't fling more than 1 screen
                         delta = Math.min(getHeight() - getPaddingBottom() - getPaddingTop() - 1, delta);
-                    }
-                    else {
+                    } else {
                         // List is moving towards the bottom. Use last view as mMotionPosition
                         int offsetToLast = getChildCount() - 1;
                         mMotionPosition = mFirstPosition + offsetToLast;
@@ -2082,8 +2822,7 @@ public abstract class ExtendableListView extends AbsListView {
                         invalidate();
                         mLastFlingY = y;
                         postOnAnimate(this);
-                    }
-                    else {
+                    } else {
                         endFling();
                     }
                     break;
@@ -2157,8 +2896,7 @@ public abstract class ExtendableListView extends AbsListView {
             if (emptyView != null) {
                 emptyView.setVisibility(View.VISIBLE);
                 setVisibility(View.GONE);
-            }
-            else {
+            } else {
                 // If the caller just removed our empty view, make sure the list view is visible
                 setVisibility(View.VISIBLE);
             }
@@ -2169,8 +2907,7 @@ public abstract class ExtendableListView extends AbsListView {
             if (mDataChanged) {
                 this.onLayout(false, getLeft(), getTop(), getRight(), getBottom());
             }
-        }
-        else {
+        } else {
             if (emptyView != null) {
                 emptyView.setVisibility(View.GONE);
             }
@@ -2200,8 +2937,7 @@ public abstract class ExtendableListView extends AbsListView {
                     && mOldItemCount == 0 && mItemCount > 0) {
                 ExtendableListView.this.onRestoreInstanceState(mInstanceState);
                 mInstanceState = null;
-            }
-            else {
+            } else {
                 rememberSyncState();
             }
 
@@ -2330,8 +3066,7 @@ public abstract class ExtendableListView extends AbsListView {
                 for (int i = 0; i < scrapCount; i++) {
                     scrap.get(i).forceLayout();
                 }
-            }
-            else {
+            } else {
                 final int typeCount = mViewTypeCount;
                 for (int i = 0; i < typeCount; i++) {
                     final ArrayList<View> scrap = mScrapViews[i];
@@ -2363,8 +3098,7 @@ public abstract class ExtendableListView extends AbsListView {
                 for (int i = 0; i < scrapCount; i++) {
                     removeDetachedView(scrap.remove(scrapCount - 1 - i), false);
                 }
-            }
-            else {
+            } else {
                 final int typeCount = mViewTypeCount;
                 for (int i = 0; i < typeCount; i++) {
                     final ArrayList<View> scrap = mScrapViews[i];
@@ -2451,8 +3185,7 @@ public abstract class ExtendableListView extends AbsListView {
         View getScrapView(int position) {
             if (mViewTypeCount == 1) {
                 return retrieveFromScrap(mCurrentScrap, position);
-            }
-            else {
+            } else {
                 int whichScrap = mAdapter.getItemViewType(position);
                 if (whichScrap >= 0 && whichScrap < mScrapViews.length) {
                     return retrieveFromScrap(mScrapViews[whichScrap], position);
@@ -2498,8 +3231,7 @@ public abstract class ExtendableListView extends AbsListView {
 
             if (mViewTypeCount == 1) {
                 mCurrentScrap.add(scrap);
-            }
-            else {
+            } else {
                 mScrapViews[viewType].add(scrap);
             }
         }
@@ -2602,8 +3334,7 @@ public abstract class ExtendableListView extends AbsListView {
                 for (int i = 0; i < scrapCount; i++) {
                     scrap.get(i).setDrawingCacheBackgroundColor(color);
                 }
-            }
-            else {
+            } else {
                 final int typeCount = mViewTypeCount;
                 for (int i = 0; i < typeCount; i++) {
                     final ArrayList<View> scrap = mScrapViews[i];
@@ -2637,8 +3368,7 @@ public abstract class ExtendableListView extends AbsListView {
                 }
             }
             return scrapViews.remove(size - 1);
-        }
-        else {
+        } else {
             return null;
         }
     }
@@ -2690,8 +3420,7 @@ public abstract class ExtendableListView extends AbsListView {
             ListAdapter adapter = getAdapter();
             if (mFirstPosition >= 0 && mFirstPosition < adapter.getCount()) {
                 mSyncRowId = adapter.getItemId(mFirstPosition);
-            }
-            else {
+            } else {
                 mSyncRowId = NO_ID;
             }
             if (v != null) {
@@ -2728,12 +3457,79 @@ public abstract class ExtendableListView extends AbsListView {
         }
     }
 
+    class MultiChoiceModeWrapper implements MultiChoiceModeListener {
+        private MultiChoiceModeListener mWrapped;
+
+        public void setWrapped(MultiChoiceModeListener wrapped) {
+            mWrapped = wrapped;
+        }
+
+        public boolean hasWrappedCallback() {
+            return mWrapped != null;
+        }
+
+        @Override
+        public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+            if (mWrapped.onCreateActionMode(mode, menu)) {
+                // Initialize checked graphic state?
+                setLongClickable(false);
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+            return mWrapped.onPrepareActionMode(mode, menu);
+        }
+
+        @Override
+        public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+            return mWrapped.onActionItemClicked(mode, item);
+        }
+
+        @Override
+        public void onDestroyActionMode(ActionMode mode) {
+            mWrapped.onDestroyActionMode(mode);
+            mChoiceActionMode = null;
+
+            // Ending selection mode means deselecting everything.
+            clearChoices();
+
+            mDataChanged = true;
+            rememberSyncState();
+            requestLayout();
+
+            setLongClickable(true);
+        }
+
+        @Override
+        public void onItemCheckedStateChanged(ActionMode mode,
+                                              int position, long id, boolean checked) {
+            mWrapped.onItemCheckedStateChanged(mode, position, id, checked);
+
+            // If there are no items selected we no longer need the selection mode.
+            if (getCheckedItemCount() == 0) {
+                mode.finish();
+            }
+        }
+    }
+
+    protected boolean isActionModeEnabled() {
+        return mChoiceActionMode != null;
+    }
+
     public static class ListSavedState extends ClassLoaderSavedState {
         protected long selectedId;
         protected long firstId;
         protected int viewTop;
         protected int position;
         protected int height;
+        String filter;
+        boolean inActionMode;
+        int checkedItemCount;
+        SparseBooleanArray checkState;
+        LongSparseArray<Integer> checkIdState;
 
         /**
          * Constructor called from {@link android.widget.AbsListView#onSaveInstanceState()}
@@ -2752,6 +3548,20 @@ public abstract class ExtendableListView extends AbsListView {
             viewTop = in.readInt();
             position = in.readInt();
             height = in.readInt();
+
+            filter = in.readString();
+            inActionMode = in.readByte() != 0;
+            checkedItemCount = in.readInt();
+            checkState = in.readSparseBooleanArray();
+            final int N = in.readInt();
+            if (N > 0) {
+                checkIdState = new LongSparseArray<Integer>();
+                for (int i = 0; i < N; i++) {
+                    final long key = in.readLong();
+                    final int value = in.readInt();
+                    checkIdState.put(key, value);
+                }
+            }
         }
 
         @Override
@@ -2762,17 +3572,30 @@ public abstract class ExtendableListView extends AbsListView {
             out.writeInt(viewTop);
             out.writeInt(position);
             out.writeInt(height);
+
+            out.writeString(filter);
+            out.writeByte((byte) (inActionMode ? 1 : 0));
+            out.writeInt(checkedItemCount);
+            out.writeSparseBooleanArray(checkState);
+            final int N = checkIdState != null ? checkIdState.size() : 0;
+            out.writeInt(N);
+            for (int i = 0; i < N; i++) {
+                out.writeLong(checkIdState.keyAt(i));
+                out.writeInt(checkIdState.valueAt(i));
+            }
         }
 
         @Override
         public String toString() {
-            return "ExtendableListView.ListSavedState{"
+            return "AbsListView.SavedState{"
                     + Integer.toHexString(System.identityHashCode(this))
                     + " selectedId=" + selectedId
                     + " firstId=" + firstId
                     + " viewTop=" + viewTop
                     + " position=" + position
-                    + " height=" + height + "}";
+                    + " height=" + height
+                    + " filter=" + filter
+                    + " checkState=" + checkState + "}";
         }
 
         public static final Creator<ListSavedState> CREATOR
@@ -2787,71 +3610,136 @@ public abstract class ExtendableListView extends AbsListView {
         };
     }
 
-
     @Override
     public Parcelable onSaveInstanceState() {
 
         Parcelable superState = super.onSaveInstanceState();
+
         ListSavedState ss = new ListSavedState(superState);
 
-        if (mSyncState != null) {
+        if (mPendingSync != null) {
             // Just keep what we last restored.
-            ss.selectedId = mSyncState.selectedId;
-            ss.firstId = mSyncState.firstId;
-            ss.viewTop = mSyncState.viewTop;
-            ss.position = mSyncState.position;
-            ss.height = mSyncState.height;
+            ss.selectedId = mPendingSync.selectedId;
+            ss.firstId = mPendingSync.firstId;
+            ss.viewTop = mPendingSync.viewTop;
+            ss.position = mPendingSync.position;
+            ss.height = mPendingSync.height;
+            ss.filter = mPendingSync.filter;
+            ss.inActionMode = mPendingSync.inActionMode;
+            ss.checkedItemCount = mPendingSync.checkedItemCount;
+            ss.checkState = mPendingSync.checkState;
+            ss.checkIdState = mPendingSync.checkIdState;
             return ss;
         }
 
         boolean haveChildren = getChildCount() > 0 && mItemCount > 0;
-        ss.selectedId = getSelectedItemId();
+        long selectedId = getSelectedItemId();
+        ss.selectedId = selectedId;
         ss.height = getHeight();
 
-        // TODO : sync selection when we handle it
-        if (haveChildren && mFirstPosition > 0) {
-            // Remember the position of the first child.
-            // We only do this if we are not currently at the top of
-            // the list, for two reasons:
-            // (1) The list may be in the process of becoming empty, in
-            // which case mItemCount may not be 0, but if we try to
-            // ask for any information about position 0 we will crash.
-            // (2) Being "at the top" seems like a special case, anyway,
-            // and the user wouldn't expect to end up somewhere else when
-            // they revisit the list even if its content has changed.
-            View v = getChildAt(0);
-            ss.viewTop = v.getTop();
-            int firstPos = mFirstPosition;
-            if (firstPos >= mItemCount) {
-                firstPos = mItemCount - 1;
-            }
-            ss.position = firstPos;
-            ss.firstId = mAdapter.getItemId(firstPos);
-        }
-        else {
-            ss.viewTop = 0;
+        if (selectedId >= 0) {
+            // Remember the selection
+//            ss.viewTop = mSelectedTop;
+            ss.position = getSelectedItemPosition();
             ss.firstId = INVALID_POSITION;
-            ss.position = 0;
+        } else {
+            if (haveChildren && mFirstPosition > 0) {
+                // Remember the position of the first child.
+                // We only do this if we are not currently at the top of
+                // the list, for two reasons:
+                // (1) The list may be in the process of becoming empty, in
+                // which case mItemCount may not be 0, but if we try to
+                // ask for any information about position 0 we will crash.
+                // (2) Being "at the top" seems like a special case, anyway,
+                // and the user wouldn't expect to end up somewhere else when
+                // they revisit the list even if its content has changed.
+                View v = getChildAt(0);
+                ss.viewTop = v.getTop();
+                int firstPos = mFirstPosition;
+                if (firstPos >= mItemCount) {
+                    firstPos = mItemCount - 1;
+                }
+                ss.position = firstPos;
+                ss.firstId = mAdapter.getItemId(firstPos);
+            } else {
+                ss.viewTop = 0;
+                ss.firstId = INVALID_POSITION;
+                ss.position = 0;
+            }
         }
 
+        ss.filter = null;
+
+        ss.inActionMode = mChoiceMode == CHOICE_MODE_MULTIPLE_MODAL && mChoiceActionMode != null;
+
+        if (mCheckStates != null) {
+            ss.checkState = mCheckStates.clone();
+        }
+        if (mCheckedIdStates != null) {
+            final LongSparseArray<Integer> idState = new LongSparseArray<Integer>();
+            final int count = mCheckedIdStates.size();
+            for (int i = 0; i < count; i++) {
+                idState.put(mCheckedIdStates.keyAt(i), mCheckedIdStates.valueAt(i));
+            }
+            ss.checkIdState = idState;
+        }
+        ss.checkedItemCount = mCheckedItemCount;
+        //TODO fix save instance
+//        ss.choiceMode = mChoiceMode;
         return ss;
     }
 
     @Override
     public void onRestoreInstanceState(Parcelable state) {
-        ListSavedState ss = (ListSavedState) state;
+        StaggeredGridView.GridListSavedState ss = (StaggeredGridView.GridListSavedState) state;
+
         super.onRestoreInstanceState(ss.getSuperState());
         mDataChanged = true;
 
         mSyncHeight = ss.height;
 
-        if (ss.firstId >= 0) {
+        if (ss.selectedId >= 0) {
             mNeedSync = true;
-            mSyncState = ss;
+            mPendingSync = ss;
+            mSyncRowId = ss.selectedId;
+            mSyncPosition = ss.position;
+            mSpecificTop = ss.viewTop;
+            mSyncMode = SYNC_SELECTED_POSITION;
+        } else if (ss.firstId >= 0) {
+            // Do this before setting mNeedSync since setNextSelectedPosition looks at mNeedSync
+            setNextSelectedPositionInt(INVALID_POSITION);
+            mSelectorPosition = INVALID_POSITION;
+            mNeedSync = true;
+            mPendingSync = ss;
             mSyncRowId = ss.firstId;
             mSyncPosition = ss.position;
             mSpecificTop = ss.viewTop;
+            mSyncMode = SYNC_FIRST_POSITION;
         }
+
+        setFilterText(ss.filter);
+
+        if (ss.checkState != null) {
+            mCheckStates = ss.checkState;
+        }
+
+        if (ss.checkIdState != null) {
+            mCheckedIdStates = ss.checkIdState;
+        }
+
+        mCheckedItemCount = ss.checkedItemCount;
+
+        //TODO fix save instance
+//        mChoiceMode = ss.choiceMode;
+
+        if (ss.inActionMode && mChoiceMode == CHOICE_MODE_MULTIPLE_MODAL &&
+                mMultiChoiceModeCallback != null) {
+            mChoiceActionMode = startActionMode(mMultiChoiceModeCallback);
+        }
+
+//        if (mCheckedIdStates != null && mCheckedIdStates.size() > 0) {
+//            updateOnScreenCheckedViews();
+//        }
         requestLayout();
     }
 
@@ -2875,25 +3763,235 @@ public abstract class ExtendableListView extends AbsListView {
             }
         }
     }
-    
-    private boolean performLongPress(final View child,
-            final int longPressPosition, final long longPressId) {
-        boolean handled = false;
 
-        OnItemLongClickListener onItemLongClickListener = getOnItemLongClickListener();
-        if (onItemLongClickListener != null) {
-            handled = onItemLongClickListener.onItemLongClick(ExtendableListView.this, child,
+    @Override
+    public boolean performItemClick(View view, int position, long id) {
+        boolean handled = false;
+        boolean dispatchItemClick = true;
+
+        if (mChoiceMode != CHOICE_MODE_NONE) {
+            handled = true;
+            boolean checkedStateChanged = false;
+
+            if (mChoiceMode == CHOICE_MODE_MULTIPLE ||
+                    (mChoiceMode == CHOICE_MODE_MULTIPLE_MODAL && mChoiceActionMode != null)) {
+                boolean checked = !mCheckStates.get(position, false);
+                mCheckStates.put(position, checked);
+                if (mCheckedIdStates != null && mAdapter.hasStableIds()) {
+                    if (checked) {
+                        mCheckedIdStates.put(mAdapter.getItemId(position), position);
+                    } else {
+                        mCheckedIdStates.delete(mAdapter.getItemId(position));
+                    }
+                }
+                if (checked) {
+                    mCheckedItemCount++;
+                } else {
+                    mCheckedItemCount--;
+                }
+                if (mChoiceActionMode != null) {
+                    mMultiChoiceModeCallback.onItemCheckedStateChanged(mChoiceActionMode,
+                            position, id, checked);
+                    dispatchItemClick = false;
+                }
+                checkedStateChanged = true;
+            } else if (mChoiceMode == CHOICE_MODE_SINGLE) {
+                boolean checked = !mCheckStates.get(position, false);
+                if (checked) {
+                    mCheckStates.clear();
+                    mCheckStates.put(position, true);
+                    if (mCheckedIdStates != null && mAdapter.hasStableIds()) {
+                        mCheckedIdStates.clear();
+                        mCheckedIdStates.put(mAdapter.getItemId(position), position);
+                    }
+                    mCheckedItemCount = 1;
+                } else if (mCheckStates.size() == 0 || !mCheckStates.valueAt(0)) {
+                    mCheckedItemCount = 0;
+                }
+                checkedStateChanged = true;
+            }
+
+            if (checkedStateChanged) {
+                updateOnScreenCheckedViews();
+            }
+        }
+
+        if (dispatchItemClick) {
+            handled |= super.performItemClick(view, position, id);
+        }
+
+        return handled;
+    }
+
+    @Override
+    public int getCheckedItemCount() {
+        return mCheckedItemCount;
+    }
+
+    /**
+     * Perform a quick, in-place update of the checked or activated state
+     * on all visible item views. This should only be called when a valid
+     * choice mode is active.
+     */
+    private void updateOnScreenCheckedViews() {
+        final int firstPos = mFirstPosition;
+        final int count = getChildCount();
+        final boolean useActivated = getContext().getApplicationInfo().targetSdkVersion
+                >= android.os.Build.VERSION_CODES.HONEYCOMB;
+        for (int i = 0; i < count; i++) {
+            final View child = getChildAt(i);
+            final int position = firstPos + i;
+
+            if (child instanceof Checkable) {
+                ((Checkable) child).setChecked(mCheckStates.get(position));
+            } else if (useActivated) {
+                child.setActivated(mCheckStates.get(position));
+            }
+        }
+    }
+
+    private boolean performLongPress(final View child, final int longPressPosition, final long longPressId) {
+        // CHOICE_MODE_MULTIPLE_MODAL takes over long press.
+        if (mChoiceMode == CHOICE_MODE_MULTIPLE_MODAL) {
+            if (mChoiceActionMode == null &&
+                    (mChoiceActionMode = startActionMode(mMultiChoiceModeCallback)) != null) {
+                setItemChecked(longPressPosition, true);
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            }
+            return true;
+        }
+
+        boolean handled = false;
+        if (mOnItemLongClickListener != null) {
+            handled = mOnItemLongClickListener.onItemLongClick(ExtendableListView.this, child,
                     longPressPosition, longPressId);
         }
-//        if (!handled) {
-//            mContextMenuInfo = createContextMenuInfo(child, longPressPosition, longPressId);
-//            handled = super.showContextMenuForChild(AbsListView.this);
-//        }
+        if (!handled) {
+            mContextMenuInfo = createContextMenuInfo(child, longPressPosition, longPressId);
+            handled = super.showContextMenuForChild(ExtendableListView.this);
+        }
         if (handled) {
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
         }
         return handled;
-    }    
+
+//        boolean handled = false;
+//
+//        OnItemLongClickListener onItemLongClickListener = getOnItemLongClickListener();
+//        if (onItemLongClickListener != null) {
+//            handled = onItemLongClickListener.onItemLongClick(ExtendableListView.this, child,
+//                    longPressPosition, longPressId);
+//        }
+////        if (!handled) {
+////            mContextMenuInfo = createContextMenuInfo(child, longPressPosition, longPressId);
+////            handled = super.showContextMenuForChild(AbsListView.this);
+////        }
+//        if (handled) {
+//            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+//        }
+//        return handled;
+    }
+
+    /**
+     * @hide
+     */
+    @Override
+    public boolean showContextMenu(float x, float y, int metaState) {
+        final int position = pointToPosition((int) x, (int) y);
+        if (position != INVALID_POSITION) {
+            final long id = mAdapter.getItemId(position);
+            View child = getChildAt(position - mFirstPosition);
+            if (child != null) {
+                mContextMenuInfo = createContextMenuInfo(child, position, id);
+                return super.showContextMenuForChild(ExtendableListView.this);
+            }
+        }
+        return super.showContextMenu(x, y, metaState);
+    }
+
+    @Override
+    public boolean showContextMenuForChild(View originalView) {
+        final int longPressPosition = getPositionForView(originalView);
+        if (longPressPosition >= 0) {
+            final long longPressId = mAdapter.getItemId(longPressPosition);
+            boolean handled = false;
+
+            if (mOnItemLongClickListener != null) {
+                handled = mOnItemLongClickListener.onItemLongClick(ExtendableListView.this, originalView,
+                        longPressPosition, longPressId);
+            }
+            if (!handled) {
+                mContextMenuInfo = createContextMenuInfo(
+                        getChildAt(longPressPosition - mFirstPosition),
+                        longPressPosition, longPressId);
+                handled = super.showContextMenuForChild(originalView);
+            }
+
+            return handled;
+        }
+        return false;
+    }
+
+    /**
+     * Creates the ContextMenuInfo returned from {@link #getContextMenuInfo()}. This
+     * methods knows the view, position and ID of the item that received the
+     * long press.
+     *
+     * @param view     The view that received the long press.
+     * @param position The position of the item that received the long press.
+     * @param id       The ID of the item that received the long press.
+     * @return The extra information that should be returned by
+     * {@link #getContextMenuInfo()}.
+     */
+    ContextMenu.ContextMenuInfo createContextMenuInfo(View view, int position, long id) {
+        return new AdapterContextMenuInfo(view, position, id);
+    }
+
+    void confirmCheckedPositionsById() {
+        // Clear out the positional check states, we'll rebuild it below from IDs.
+        mCheckStates.clear();
+
+        boolean checkedCountChanged = false;
+        for (int checkedIndex = 0; checkedIndex < mCheckedIdStates.size(); checkedIndex++) {
+            final long id = mCheckedIdStates.keyAt(checkedIndex);
+            final int lastPos = mCheckedIdStates.valueAt(checkedIndex);
+
+            final long lastPosId = mAdapter.getItemId(lastPos);
+            if (id != lastPosId) {
+                // Look around to see if the ID is nearby. If not, uncheck it.
+                final int start = Math.max(0, lastPos - CHECK_POSITION_SEARCH_DISTANCE);
+                final int end = Math.min(lastPos + CHECK_POSITION_SEARCH_DISTANCE, mItemCount);
+                boolean found = false;
+                for (int searchPos = start; searchPos < end; searchPos++) {
+                    final long searchId = mAdapter.getItemId(searchPos);
+                    if (id == searchId) {
+                        found = true;
+                        mCheckStates.put(searchPos, true);
+                        mCheckedIdStates.setValueAt(checkedIndex, searchPos);
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    mCheckedIdStates.delete(id);
+                    checkedIndex--;
+                    mCheckedItemCount--;
+                    checkedCountChanged = true;
+                    if (mChoiceActionMode != null && mMultiChoiceModeCallback != null) {
+                        mMultiChoiceModeCallback.onItemCheckedStateChanged(mChoiceActionMode,
+                                lastPos, id, false);
+                    }
+                }
+            } else {
+                mCheckStates.put(lastPos, true);
+            }
+        }
+
+        if (checkedCountChanged && mChoiceActionMode != null) {
+            mChoiceActionMode.invalidate();
+        }
+    }
+
 
     /**
      * A base class for Runnables that will check that their view is still attached to
@@ -2909,5 +4007,96 @@ public abstract class ExtendableListView extends AbsListView {
         public boolean sameWindow() {
             return hasWindowFocus() && getWindowAttachCount() == mOriginalAttachCount;
         }
+    }
+
+    static class SavedState extends BaseSavedState {
+        long selectedId;
+        long firstId;
+        int viewTop;
+        int position;
+        int height;
+        String filter;
+        boolean inActionMode;
+        int checkedItemCount;
+        SparseBooleanArray checkState;
+        LongSparseArray<Integer> checkIdState;
+
+        /**
+         * Constructor called from {@link android.widget.AbsListView#onSaveInstanceState()}
+         */
+        SavedState(Parcelable superState) {
+            super(superState);
+        }
+
+        /**
+         * Constructor called from {@link #CREATOR}
+         */
+        private SavedState(Parcel in) {
+            super(in);
+            selectedId = in.readLong();
+            firstId = in.readLong();
+            viewTop = in.readInt();
+            position = in.readInt();
+            height = in.readInt();
+            filter = in.readString();
+            inActionMode = in.readByte() != 0;
+            checkedItemCount = in.readInt();
+            checkState = in.readSparseBooleanArray();
+            final int N = in.readInt();
+            if (N > 0) {
+                checkIdState = new LongSparseArray<Integer>();
+                for (int i = 0; i < N; i++) {
+                    final long key = in.readLong();
+                    final int value = in.readInt();
+                    checkIdState.put(key, value);
+                }
+            }
+        }
+
+        @Override
+        public void writeToParcel(Parcel out, int flags) {
+            super.writeToParcel(out, flags);
+            out.writeLong(selectedId);
+            out.writeLong(firstId);
+            out.writeInt(viewTop);
+            out.writeInt(position);
+            out.writeInt(height);
+            out.writeString(filter);
+            out.writeByte((byte) (inActionMode ? 1 : 0));
+            out.writeInt(checkedItemCount);
+            out.writeSparseBooleanArray(checkState);
+            final int N = checkIdState != null ? checkIdState.size() : 0;
+            out.writeInt(N);
+            for (int i = 0; i < N; i++) {
+                out.writeLong(checkIdState.keyAt(i));
+                out.writeInt(checkIdState.valueAt(i));
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "AbsListView.SavedState{"
+                    + Integer.toHexString(System.identityHashCode(this))
+                    + " selectedId=" + selectedId
+                    + " firstId=" + firstId
+                    + " viewTop=" + viewTop
+                    + " position=" + position
+                    + " height=" + height
+                    + " filter=" + filter
+                    + " checkState=" + checkState + "}";
+        }
+
+        public static final Creator<SavedState> CREATOR
+                = new Creator<SavedState>() {
+            @Override
+            public SavedState createFromParcel(Parcel in) {
+                return new SavedState(in);
+            }
+
+            @Override
+            public SavedState[] newArray(int size) {
+                return new SavedState[size];
+            }
+        };
     }
 }
