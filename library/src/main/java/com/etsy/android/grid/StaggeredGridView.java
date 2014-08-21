@@ -847,7 +847,7 @@ public class StaggeredGridView extends ExtendableListView {
     }
 
     private void alignTops() {
-        if (mFirstPosition == getHeaderViewsCount()) {
+        if (mFirstPosition == getHeaderViewsCount() + (isShowFirstItemAtFullWidth(mFirstPosition)?1:0)) {
             // we're showing all the views before the header views
             int[] nonHeaderTops = getHighestNonHeaderTops();
             // we should now have our non header tops
