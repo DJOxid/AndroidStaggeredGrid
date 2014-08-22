@@ -227,7 +227,6 @@ public abstract class ExtendableListView extends AbsListView {
      * the sync happens, we can return this existing data rather than losing
      * it.
      */
-    private StaggeredGridView.GridListSavedState mPendingSync;
     private int mTranscriptMode;
     /**
      * Regular layout - usually an unsolicited layout from the view system
@@ -1162,7 +1161,7 @@ public abstract class ExtendableListView extends AbsListView {
 
     @Override
     protected void handleDataChanged() {
-//        super.handleDataChanged();
+        super.handleDataChanged();
 
         int count = mItemCount;
         int lastHandledItemCount = mLastHandledItemCount;
@@ -1183,7 +1182,7 @@ public abstract class ExtendableListView extends AbsListView {
             if (mNeedSync) {
                 // Update this first, since setNextSelectedPositionInt inspects it
                 mNeedSync = false;
-                mPendingSync = null;
+                mSyncState = null;
 
                 if (mTranscriptMode == TRANSCRIPT_MODE_ALWAYS_SCROLL) {
                     mLayoutMode = LAYOUT_FORCE_BOTTOM;
@@ -1299,7 +1298,7 @@ public abstract class ExtendableListView extends AbsListView {
         mNextSelectedPosition = INVALID_POSITION;
         mNextSelectedRowId = INVALID_ROW_ID;
         mNeedSync = false;
-        mPendingSync = null;
+        mSyncState = null;
         mSelectorPosition = INVALID_POSITION;
         checkSelectionChanged();
     }
@@ -3618,18 +3617,18 @@ public abstract class ExtendableListView extends AbsListView {
 
         ListSavedState ss = new ListSavedState(superState);
 
-        if (mPendingSync != null) {
+        if (mSyncState != null) {
             // Just keep what we last restored.
-            ss.selectedId = mPendingSync.selectedId;
-            ss.firstId = mPendingSync.firstId;
-            ss.viewTop = mPendingSync.viewTop;
-            ss.position = mPendingSync.position;
-            ss.height = mPendingSync.height;
-            ss.filter = mPendingSync.filter;
-            ss.inActionMode = mPendingSync.inActionMode;
-            ss.checkedItemCount = mPendingSync.checkedItemCount;
-            ss.checkState = mPendingSync.checkState;
-            ss.checkIdState = mPendingSync.checkIdState;
+            ss.selectedId = mSyncState.selectedId;
+            ss.firstId = mSyncState.firstId;
+            ss.viewTop = mSyncState.viewTop;
+            ss.position = mSyncState.position;
+            ss.height = mSyncState.height;
+            ss.filter = mSyncState.filter;
+            ss.inActionMode = mSyncState.inActionMode;
+            ss.checkedItemCount = mSyncState.checkedItemCount;
+            ss.checkState = mSyncState.checkState;
+            ss.checkIdState = mSyncState.checkIdState;
             return ss;
         }
 
@@ -3691,7 +3690,7 @@ public abstract class ExtendableListView extends AbsListView {
 
     @Override
     public void onRestoreInstanceState(Parcelable state) {
-        StaggeredGridView.GridListSavedState ss = (StaggeredGridView.GridListSavedState) state;
+        ListSavedState ss = (ListSavedState) state;
 
         super.onRestoreInstanceState(ss.getSuperState());
         mDataChanged = true;
@@ -3700,7 +3699,7 @@ public abstract class ExtendableListView extends AbsListView {
 
         if (ss.selectedId >= 0) {
             mNeedSync = true;
-            mPendingSync = ss;
+            mSyncState = ss;
             mSyncRowId = ss.selectedId;
             mSyncPosition = ss.position;
             mSpecificTop = ss.viewTop;
@@ -3710,7 +3709,7 @@ public abstract class ExtendableListView extends AbsListView {
             setNextSelectedPositionInt(INVALID_POSITION);
             mSelectorPosition = INVALID_POSITION;
             mNeedSync = true;
-            mPendingSync = ss;
+            mSyncState = ss;
             mSyncRowId = ss.firstId;
             mSyncPosition = ss.position;
             mSpecificTop = ss.viewTop;
@@ -3988,96 +3987,5 @@ public abstract class ExtendableListView extends AbsListView {
         public boolean sameWindow() {
             return hasWindowFocus() && getWindowAttachCount() == mOriginalAttachCount;
         }
-    }
-
-    static class SavedState extends BaseSavedState {
-        long selectedId;
-        long firstId;
-        int viewTop;
-        int position;
-        int height;
-        String filter;
-        boolean inActionMode;
-        int checkedItemCount;
-        SparseBooleanArray checkState;
-        LongSparseArray<Integer> checkIdState;
-
-        /**
-         * Constructor called from {@link android.widget.AbsListView#onSaveInstanceState()}
-         */
-        SavedState(Parcelable superState) {
-            super(superState);
-        }
-
-        /**
-         * Constructor called from {@link #CREATOR}
-         */
-        private SavedState(Parcel in) {
-            super(in);
-            selectedId = in.readLong();
-            firstId = in.readLong();
-            viewTop = in.readInt();
-            position = in.readInt();
-            height = in.readInt();
-            filter = in.readString();
-            inActionMode = in.readByte() != 0;
-            checkedItemCount = in.readInt();
-            checkState = in.readSparseBooleanArray();
-            final int N = in.readInt();
-            if (N > 0) {
-                checkIdState = new LongSparseArray<Integer>();
-                for (int i = 0; i < N; i++) {
-                    final long key = in.readLong();
-                    final int value = in.readInt();
-                    checkIdState.put(key, value);
-                }
-            }
-        }
-
-        @Override
-        public void writeToParcel(Parcel out, int flags) {
-            super.writeToParcel(out, flags);
-            out.writeLong(selectedId);
-            out.writeLong(firstId);
-            out.writeInt(viewTop);
-            out.writeInt(position);
-            out.writeInt(height);
-            out.writeString(filter);
-            out.writeByte((byte) (inActionMode ? 1 : 0));
-            out.writeInt(checkedItemCount);
-            out.writeSparseBooleanArray(checkState);
-            final int N = checkIdState != null ? checkIdState.size() : 0;
-            out.writeInt(N);
-            for (int i = 0; i < N; i++) {
-                out.writeLong(checkIdState.keyAt(i));
-                out.writeInt(checkIdState.valueAt(i));
-            }
-        }
-
-        @Override
-        public String toString() {
-            return "AbsListView.SavedState{"
-                    + Integer.toHexString(System.identityHashCode(this))
-                    + " selectedId=" + selectedId
-                    + " firstId=" + firstId
-                    + " viewTop=" + viewTop
-                    + " position=" + position
-                    + " height=" + height
-                    + " filter=" + filter
-                    + " checkState=" + checkState + "}";
-        }
-
-        public static final Creator<SavedState> CREATOR
-                = new Creator<SavedState>() {
-            @Override
-            public SavedState createFromParcel(Parcel in) {
-                return new SavedState(in);
-            }
-
-            @Override
-            public SavedState[] newArray(int size) {
-                return new SavedState[size];
-            }
-        };
     }
 }

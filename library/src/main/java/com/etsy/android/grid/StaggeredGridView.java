@@ -40,7 +40,7 @@ import java.util.Arrays;
 public class StaggeredGridView extends ExtendableListView {
 
     private static final String TAG = "StaggeredGridView";
-    private static final boolean DBG = false;
+    private static final boolean DBG = true;
 
     private static final int DEFAULT_COLUMNS_PORTRAIT = 2;
     private static final int DEFAULT_COLUMNS_LANDSCAPE = 3;
@@ -237,6 +237,12 @@ public class StaggeredGridView extends ExtendableListView {
         requestLayoutChildren();
     }
 
+    /**
+     * Sets columns count. <br>
+     * NOT USE AT START. USE setColumnCountNonForced
+     *
+     * @param columnCount columns count.
+     */
     public void setColumnCount(int columnCount) {
         //TODO this 2 rows may have problem when when we change column count in runtime
         stopFlingRunnable();
@@ -250,6 +256,12 @@ public class StaggeredGridView extends ExtendableListView {
         requestLayoutChildren();
     }
 
+    /**
+     * Sets columns count. <br>
+     * US IT AT APPLICATION START.
+     *
+     * @param columnCount columns count.
+     */
     public void setColumnCountNonForced(int columnCount) {
         mColumnCountPortrait = columnCount;
         mColumnCountLandscape = columnCount;
@@ -306,7 +318,7 @@ public class StaggeredGridView extends ExtendableListView {
             if (DBG) Log.d(TAG, "onMeasureChild BEFORE position:" + position +
                     " h:" + getMeasuredHeight());
             // measure it to the width of our column.
-            int childWidthSpec = 0;
+            int childWidthSpec;
             if (isShowFirstItemAtFullWidth(position)) {
                 childWidthSpec = MeasureSpec.makeMeasureSpec(calculateColumnWidth(getWidth(), 1), MeasureSpec.EXACTLY);
             } else {
@@ -629,7 +641,7 @@ public class StaggeredGridView extends ExtendableListView {
     }
 
     private int getChildTopMargin(final int position) {
-        boolean isFirstRow = position < (getHeaderViewsCount() + mColumnCount - (firstItemFullWidth ? 1 : 0));
+        boolean isFirstRow = position < (getHeaderViewsCount() + mColumnCount - (firstItemFullWidth && mColumnCount > 1 ? 1 : 0));
         return isFirstRow ? mItemMargin : 0;
     }
 
@@ -681,7 +693,7 @@ public class StaggeredGridView extends ExtendableListView {
 
     @Override
     protected int getChildTop(final int position) {
-        if (isHeaderOrFooter(position)) {
+        if (isHeaderOrFooter(position) || isShowFirstItemAtFullWidth(position)) {
             return super.getChildTop(position);
         } else {
             final int column = getPositionColumn(position);
@@ -724,7 +736,7 @@ public class StaggeredGridView extends ExtendableListView {
      */
     @Override
     protected int getNextChildUpsBottom(final int position) {
-        if (isHeaderOrFooter(position) || isShowFirstItemAtFullWidth(position)) {
+        if (isHeaderOrFooter(position)/* || isShowFirstItemAtFullWidth(position)*/) {
             return super.getNextChildUpsBottom(position);
         } else {
             return getLowestPositionedTop();
@@ -750,8 +762,11 @@ public class StaggeredGridView extends ExtendableListView {
 
     @Override
     protected int getHighestChildTop() {
-        if (isHeaderOrFooter(mFirstPosition) || isShowFirstItemAtFullWidth(mFirstPosition)) {
+        if (isHeaderOrFooter(mFirstPosition)) {
             return super.getHighestChildTop();
+        }
+        if (isShowFirstItemAtFullWidth(mFirstPosition)) {
+            return super.getHighestChildTop() - getChildTopMargin(mFirstPosition);
         }
         return getHighestPositionedTop();
     }
@@ -791,7 +806,7 @@ public class StaggeredGridView extends ExtendableListView {
 
     private void offsetDistanceToTop(final int offset) {
         mDistanceToTop += offset;
-        if (DBG) Log.d(TAG, "offset mDistanceToTop:" + mDistanceToTop);
+//        if (DBG) Log.d(TAG, "offset mDistanceToTop:" + mDistanceToTop);
     }
 
     public int getDistanceToTop() {
@@ -991,7 +1006,7 @@ public class StaggeredGridView extends ExtendableListView {
      */
     private void onColumnSync() {
         // re-calc tops for new column count!
-        int syncPosition = Math.min(mSyncPosition, getCount() - 1);
+        int syncPosition = Math.min(mSyncPosition+5, getCount() - 1);
 
         SparseArray<Double> positionHeightRatios = new SparseArray<Double>(syncPosition);
         for (int pos = 0; pos < syncPosition; pos++) {
@@ -1024,10 +1039,19 @@ public class StaggeredGridView extends ExtendableListView {
             int top;
             int bottom;
             // check for headers
-            if (isHeaderOrFooter(pos) || isShowFirstItemAtFullWidth(pos)) {
+            if (isHeaderOrFooter(pos)) {
                 // the next top is the bottom for that column
                 top = getLowestPositionedBottom();
                 bottom = top + height;
+
+                for (int i = 0; i < mColumnCount; i++) {
+                    mColumnTops[i] = top;
+                    mColumnBottoms[i] = bottom;
+                }
+            }else if(isShowFirstItemAtFullWidth(pos)){
+                // the next top is the bottom for that column
+                top = getLowestPositionedBottom();
+                bottom = top + height + getChildTopMargin(pos) + getChildBottomMargin();
 
                 for (int i = 0; i < mColumnCount; i++) {
                     mColumnTops[i] = top;
@@ -1120,7 +1144,7 @@ public class StaggeredGridView extends ExtendableListView {
      * @return
      */
     private boolean isShowFirstItemAtFullWidth(int position) {
-        return position == getHeaderViewsCount() && firstItemFullWidth;
+        return (position == getHeaderViewsCount() && firstItemFullWidth) && mColumnCount > 1;
     }
 
     /**
