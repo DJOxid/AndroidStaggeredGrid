@@ -77,7 +77,7 @@ public abstract class ExtendableListView extends AbsListView {
 
     private static final String TAG = "ExtendableListView";
 
-    private static final boolean DBG = true;
+    private static final boolean DBG = false;
 
     private static final int TOUCH_MODE_IDLE = 0;
     private static final int TOUCH_MODE_SCROLLING = 1;
@@ -2297,7 +2297,8 @@ public abstract class ExtendableListView extends AbsListView {
         final boolean isPressed = mode > TOUCH_MODE_DOWN && mode < TOUCH_MODE_SCROLLING &&
                 mMotionPosition == position;
         final boolean updateChildPressed = isPressed != child.isPressed();
-        final boolean needToMeasure = !recycled || updateChildSelected || child.isLayoutRequested();
+        //TODO: should be "!recycled". Need to make new measure system when we have first item at full width
+        final boolean needToMeasure = recycled || updateChildSelected || child.isLayoutRequested();
 
         int itemViewType = mAdapter.getItemViewType(position);
 
@@ -3684,8 +3685,7 @@ public abstract class ExtendableListView extends AbsListView {
             ss.checkIdState = idState;
         }
         ss.checkedItemCount = mCheckedItemCount;
-        //TODO fix save instance
-//        ss.choiceMode = mChoiceMode;
+
         return ss;
     }
 
@@ -3737,9 +3737,6 @@ public abstract class ExtendableListView extends AbsListView {
             mChoiceActionMode = startActionMode(mMultiChoiceModeCallback);
         }
 
-//        if (mCheckedIdStates != null && mCheckedIdStates.size() > 0) {
-//            updateOnScreenCheckedViews();
-//        }
         requestLayout();
     }
 
@@ -3874,22 +3871,6 @@ public abstract class ExtendableListView extends AbsListView {
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
         }
         return handled;
-
-//        boolean handled = false;
-//
-//        OnItemLongClickListener onItemLongClickListener = getOnItemLongClickListener();
-//        if (onItemLongClickListener != null) {
-//            handled = onItemLongClickListener.onItemLongClick(ExtendableListView.this, child,
-//                    longPressPosition, longPressId);
-//        }
-////        if (!handled) {
-////            mContextMenuInfo = createContextMenuInfo(child, longPressPosition, longPressId);
-////            handled = super.showContextMenuForChild(AbsListView.this);
-////        }
-//        if (handled) {
-//            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-//        }
-//        return handled;
     }
 
     /**
